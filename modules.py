@@ -1,28 +1,44 @@
+import dataclasses
 import jax
 import jax.numpy as jnp
 
-# TODO: add JAX typing
+# TODO: add JAX typing with expected shapes and tensor types.
+# TODO: use flax nn.Module?
+
+@dataclasses.dataclass
+class TransformerConfig:
+    n_layers: int
+    d_vocab: int
+    d_model: int
+    d_head: int
+    d_mlp: int
+    n_head: int
+    n_ctx: int
+    init_range: float = 0.02
+    ln_eps: float = 1e-5
 
 
 class LayerNorm:
-    def __init__(self, key, d_model:int, eps:float=1e-5):
+    def __init__(self, key, d_model: int, eps: float = 1e-5):
         self.d_model = d_model
         self.eps = eps
         self.params = self.initialize_params(key)
 
     def initialize_params(self, key):
         w_key, b_key = jax.random.split(key)
-        w = jax.nn.initializers.ones(key, self.d_model)
-        b = jax.nn.initializers.zeros(key, self.d_model)
+        w = jax.nn.initializers.ones(w_key, self.d_model)
+        b = jax.nn.initializers.zeros(b_key, self.d_model)
         return {"w": w, "b": b}
 
     def __call__(self, x):
         mean = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
         std = jnp.sqrt(var + self.eps)
+        x_normalized = (x - mean) / std
 
-        w,b = self.params["w"], self.params["b"]
-        return (x - mean) / std * w + b
+        w, b = self.params["w"], self.params["b"]
+        output = x_normalized * w + b
+        return output
     
 
 class Embed:
@@ -57,8 +73,12 @@ class PosEmbed:
             }
 
     def __call__(self, x):
+        batch, seqlen = x.shape
         W_P = self.params["W_P"]
-        return W_P[x]
+        pos_embed = W_P[:seqlen]
+        pos_embed = jnp.expand_dims(pos_embed, 0)
+        pos_embed = jnp.tile(pos_embed, (batch, 1, 1))
+        return pos_embed
 
 
 class Attention:
@@ -167,3 +187,52 @@ class TransformerBlock:
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
+    
+
+class Unembed:
+    def __init__(self, key, d_vocab: int, d_model: int, init_range:float = 0.02):
+        self.d_vocab = d_vocab
+        self.d_model = d_model
+        self.init_range = init_range
+        self.params = self.initialize_params(key)
+    
+    def initialize_params(self, key):
+        w_init = jax.nn.initializers.normal(self.init_range)
+        return {
+            "W_U": w_init(key, (self.d_model, self.d_vocab)),
+            "b_U": jax.nn.initializers.zeros(key, self.d_vocab)
+        }
+    
+    def __call__(self, x):
+        unembed = jnp.einsum(
+            "bse,ev->bsv", x, self.params["W_U"]
+        ) + self.params["b_U"]
+        return unembed
+
+
+class TransformerModel:
+    def __init__(self, key, cfg):
+        self.cfg = cfg
+        key1, key2, key3, key4, key5, key6 = jax.random.split(key, 6)
+
+        self.embed = Embed(key1, cfg.d_vocab, cfg.d_model, cfg.init_range)
+        self.pos_embed = PosEmbed(key2, cfg.n_ctx, cfg.d_model, cfg.init_range)
+        self.transformer_blocks = [
+            TransformerBlock(
+                key3, cfg.d_model, cfg.n_head, cfg.d_head, cfg.d_mlp, cfg.ln_eps, cfg.init_range)
+                for _ in range(cfg.n_layers)
+                ]
+        self.ln = LayerNorm(key4, cfg.d_model, cfg.ln_eps)
+        self.unembed = Unembed(key5, cfg.d_vocab, cfg.d_model, cfg.init_range)
+    
+    def __call__(self, x):
+        embed = self.embed(x)
+        pos_embed = self.pos_embed(x)
+        res = embed + pos_embed
+
+        for block in self.transformer_blocks:
+            res = block(res)
+        
+        logits = self.unembed(self.ln(res))
+    
+        return logits
